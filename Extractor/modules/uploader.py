@@ -7,6 +7,7 @@ import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import MessageNotModified
+from pyrogram import StopPropagation
 from Extractor import app
 from config import OWNER_ID
 
@@ -53,13 +54,16 @@ async def stop_cmd(client: Client, message: Message):
 
 @app.on_message(filters.command("upload") & is_admin)
 async def upload_cmd(client: Client, message: Message):
-    global WAITING_FOR_FILE, cancel_process
+    global cancel_process
     if TARGET_CHANNEL_ID is None:
         await message.reply_text("⚠️ Please set the target channel ID first using `/id <channel_id>`")
         return
     
     cancel_process = False
-    WAITING_FOR_FILE = True
+    if not hasattr(client, 'awaiting_upload'):
+        client.awaiting_upload = {}
+    client.awaiting_upload[message.from_user.id] = True
+    
     await message.reply_text("📂 Please send me the `.txt` file containing the titles and URLs.")
 
 # ==========================================
@@ -102,18 +106,26 @@ def yt_progress_hook(d, status_msg, client, last_edit_time, title):
 # File Processing & Downloading Engines
 # ==========================================
 
-@app.on_message(filters.document & is_admin)
+@app.on_message(filters.document & is_admin, group=-1)
 async def handle_document(client: Client, message: Message):
-    global WAITING_FOR_FILE, cancel_process
+    global cancel_process
     
-    if not WAITING_FOR_FILE:
+    if not getattr(client, 'awaiting_upload', {}).get(message.from_user.id):
         return
         
+    client.awaiting_upload[message.from_user.id] = False
+    
     if not message.document.file_name.endswith(".txt"):
         await message.reply_text("❌ Please send a valid `.txt` file.")
-        return
+        raise StopPropagation
         
-    WAITING_FOR_FILE = False
+    # Process asynchronously so we can immediately raise StopPropagation to block other handlers
+    asyncio.create_task(process_document(client, message))
+    raise StopPropagation
+
+async def process_document(client: Client, message: Message):
+    global cancel_process
+    
     status_msg = await message.reply_text("⏳ Downloading the .txt file...")
     
     file_path = await message.download()
