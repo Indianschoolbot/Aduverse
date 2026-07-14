@@ -1,6 +1,5 @@
 pyrogram==2.0.106
 pyromod==1.5
-tgcrypto
 aiohttp
 aiofiles
 requests
@@ -21,4 +20,4 @@ termcolor
 dotenv
 flask
 pyrogram
-tgcrypto
+yt-dlp
