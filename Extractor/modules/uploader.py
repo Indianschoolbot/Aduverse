@@ -9,6 +9,8 @@ from pyrogram.types import Message
 from pyrogram.errors import MessageNotModified
 from pyrogram import StopPropagation
 from Extractor import app
+import urllib.parse
+import tempfile
 from config import OWNER_ID
 
 ADMIN_ID = OWNER_ID
@@ -178,6 +180,10 @@ async def process_document(client: Client, message: Message):
                 url = url.replace('\n', '').replace('\r', '').replace(' ', '')
                 url = url.replace('%0A', '').replace('%0D', '')
                 
+                # Unquote Appx complex URLs to fix HTML entities and percent encoding
+                if 'URLPrefix=' in url or '&' in url:
+                    url = urllib.parse.unquote(url)
+                
                 parsed_items.append((title, url))
                 i = j - 1
             i += 1
@@ -218,7 +224,39 @@ async def download_pdf(url: str, title: str) -> str:
                 return file_name
     return None
 
-def download_video(url: str, title: str, status_msg: Message, client: Client, token: str = None) -> str:
+async def fetch_pw_credentials(child_id: str, token: str):
+    """Hits PenPencil API to fetch CloudFront signed cookies and authenticated URLs."""
+    url = f"https://api.penpencil.co/v1/videos/{child_id}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "client-type": "WEB",
+        "client-version": "3.3.0",
+        "Accept": "application/json, text/plain, */*"
+    }
+    
+    cf_cookies = {}
+    auth_url = None
+    
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as response:
+            # Extract CloudFront Cookies
+            for cookie_name, cookie_morsel in response.cookies.items():
+                if cookie_name.startswith("CloudFront-"):
+                    cf_cookies[cookie_name] = cookie_morsel.value
+                    
+            try:
+                data = await response.json()
+                if data.get("data"):
+                    # Attempt to extract DASH/HLS URL directly from the video details JSON
+                    video_data = data["data"]
+                    if isinstance(video_data, dict):
+                        auth_url = video_data.get("dashUrl") or video_data.get("hlsUrl") or video_data.get("url")
+            except:
+                pass
+                
+    return cf_cookies, auth_url
+
+def download_video(url: str, title: str, status_msg: Message, client: Client, token: str = None, cf_cookies: dict = None) -> str:
     """Downloads a video (including .mpd) using yt-dlp and ffmpeg."""
     safe_title = "".join(x for x in title if x.isalnum() or x in "._- ")
     last_edit_time = [0.0]
@@ -235,7 +273,9 @@ def download_video(url: str, title: str, status_msg: Message, client: Client, to
     
     if token:
         headers['Authorization'] = f'Bearer {token}'
-        headers['Cookie'] = f'token={token}'
+        # If we don't have explicit CF cookies, fallback to passing token as cookie
+        if not cf_cookies:
+            headers['Cookie'] = f'token={token}'
         
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
@@ -248,25 +288,64 @@ def download_video(url: str, title: str, status_msg: Message, client: Client, to
         'sleep_requests': 1
     }
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        
-        # Since merge_output_format is mp4, the final file might end with .mp4
-        if not os.path.exists(filename):
-            base, _ = os.path.splitext(filename)
-            for ext in ['.mp4', '.mkv', '.webm']:
-                if os.path.exists(base + ext):
-                    return base + ext
-        return filename
+    cookie_file_path = None
+    if cf_cookies:
+        # Create a temporary Netscape HTTP Cookie File
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.txt') as f:
+            cookie_file_path = f.name
+            f.write("# Netscape HTTP Cookie File\n")
+            # For cloudfront URLs, domain is usually the host of the URL
+            domain = urllib.parse.urlparse(url).hostname or ".cloudfront.net"
+            for k, v in cf_cookies.items():
+                f.write(f"{domain}\tTRUE\t/\tFALSE\t0\t{k}\t{v}\n")
+        ydl_opts['cookiefile'] = cookie_file_path
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            
+            if not os.path.exists(filename):
+                base, _ = os.path.splitext(filename)
+                for ext in ['.mp4', '.mkv', '.webm']:
+                    if os.path.exists(base + ext):
+                        return base + ext
+            return filename
+    finally:
+        if cookie_file_path and os.path.exists(cookie_file_path):
+            os.remove(cookie_file_path)
 
 async def process_link(client: Client, title: str, url: str, status_msg: Message, token: str = None):
     """Orchestrates downloading and uploading for a single line."""
-    await update_status(status_msg, f"🔄 **Processing:** `{title}`\n📥 **Status:** Downloading...")
+    await update_status(status_msg, f"🔄 **Processing:** `{title}`\n📥 **Status:** Initializing...")
     
     downloaded_file = None
     is_video = False
     
+    # 1. API Pre-Processor Logic
+    cf_cookies = None
+    if token and 'childId=' in url:
+        try:
+            # Parse childId
+            parsed_url = urllib.parse.urlparse(url)
+            query_params = urllib.parse.parse_qs(parsed_url.query)
+            child_id = query_params.get('childId', [None])[0]
+            
+            if child_id:
+                await update_status(status_msg, f"🔄 **Processing:** `{title}`\n🔑 **Status:** Fetching Signed Cookies...")
+                cf_cookies, auth_url = await fetch_pw_credentials(child_id, token)
+                
+                # Strip parentId and childId from the yt-dlp target URL
+                url = url.split('&parentId=')[0].split('?parentId=')[0]
+                
+                # If API returned a direct authenticated URL, prefer it
+                if auth_url and ('http' in auth_url):
+                    url = auth_url
+        except Exception as e:
+            await client.send_message(status_msg.chat.id, f"⚠️ API Pre-Processor Warning: {e}")
+
+    await update_status(status_msg, f"🔄 **Processing:** `{title}`\n📥 **Status:** Downloading...")
+
     try:
         if url.lower().endswith(".pdf"):
             downloaded_file = await download_pdf(url, title)
@@ -274,7 +353,7 @@ async def process_link(client: Client, title: str, url: str, status_msg: Message
             is_video = True
             loop = asyncio.get_event_loop()
             try:
-                downloaded_file = await loop.run_in_executor(None, download_video, url, title, status_msg, client, token)
+                downloaded_file = await loop.run_in_executor(None, download_video, url, title, status_msg, client, token, cf_cookies)
             except Exception as e:
                 await client.send_message(status_msg.chat.id, f"❌ Failed to download video.\nError: {str(e)}\nURL: {url}")
                 return
