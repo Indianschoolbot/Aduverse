@@ -16,11 +16,12 @@ BOT_TOKEN = "8871109208:AAFtOCsd4Mbu4macLkD5niFUcEuEDwlVc7w"  # Replace with you
 ADMIN_ID = 1450246428  # Replace with your Telegram User ID (integer)
 
 # Initialize Pyrogram Client
-app = Client("uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+app = Client(":memory:", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # Global variables to store state
 TARGET_CHANNEL_ID = None
 WAITING_FOR_FILE = False
+cancel_process = False
 
 async def update_status(status_msg: Message, text: str):
     try:
@@ -59,13 +60,20 @@ async def set_channel_id(client: Client, message: Message):
     else:
         await message.reply_text("ℹ️ Usage: `/id <channel_id>`")
 
+@app.on_message(filters.command("stop") & is_admin)
+async def stop_cmd(client: Client, message: Message):
+    global cancel_process
+    cancel_process = True
+    await message.reply_text("🛑 Processing stopped by Admin.")
+
 @app.on_message(filters.command("upload") & is_admin)
 async def upload_cmd(client: Client, message: Message):
-    global WAITING_FOR_FILE
+    global WAITING_FOR_FILE, cancel_process
     if TARGET_CHANNEL_ID is None:
         await message.reply_text("⚠️ Please set the target channel ID first using `/id <channel_id>`")
         return
     
+    cancel_process = False
     WAITING_FOR_FILE = True
     await message.reply_text("📂 Please send me the `.txt` file containing the titles and URLs.")
 
@@ -96,6 +104,11 @@ async def handle_document(client: Client, message: Message):
             
         i = 0
         while i < len(lines):
+            global cancel_process
+            if cancel_process:
+                await client.send_message(message.chat.id, "🛑 Process was cancelled by Admin.")
+                break
+                
             line = lines[i]
             
             # Extract URL using Regex
@@ -148,28 +161,24 @@ def download_video(url: str, title: str) -> str:
     
     # yt-dlp configuration for downloading and merging to mp4
     ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'outtmpl': f'{safe_title}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
     }
     
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            
-            # Since merge_output_format is mp4, the final file might end with .mp4
-            if not os.path.exists(filename):
-                base, _ = os.path.splitext(filename)
-                for ext in ['.mp4', '.mkv', '.webm']:
-                    if os.path.exists(base + ext):
-                        return base + ext
-            return filename
-    except Exception as e:
-        print(f"yt-dlp error for {url}: {e}")
-        return None
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        
+        # Since merge_output_format is mp4, the final file might end with .mp4
+        if not os.path.exists(filename):
+            base, _ = os.path.splitext(filename)
+            for ext in ['.mp4', '.mkv', '.webm']:
+                if os.path.exists(base + ext):
+                    return base + ext
+        return filename
 
 async def process_link(client: Client, title: str, url: str, status_msg: Message):
     """Orchestrates downloading and uploading for a single line."""
@@ -186,7 +195,11 @@ async def process_link(client: Client, title: str, url: str, status_msg: Message
             is_video = True
             # yt-dlp is synchronous, so we run it in an executor to avoid blocking the bot
             loop = asyncio.get_event_loop()
-            downloaded_file = await loop.run_in_executor(None, download_video, url, title)
+            try:
+                downloaded_file = await loop.run_in_executor(None, download_video, url, title)
+            except Exception as e:
+                await client.send_message(status_msg.chat.id, f"❌ Failed to download video.\nError: {str(e)}\nURL: {url}")
+                return
             
         if not downloaded_file or not os.path.exists(downloaded_file):
             await client.send_message(status_msg.chat.id, f"❌ Failed to download:\n`{title}`\nURL: {url}")
