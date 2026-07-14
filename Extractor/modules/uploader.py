@@ -135,12 +135,9 @@ async def process_document(client: Client, message: Message):
         with open(file_path, "r", encoding="utf-8") as f:
             lines = [line.strip() for line in f.readlines() if line.strip()]
             
+        parsed_items = []
         i = 0
         while i < len(lines):
-            if cancel_process:
-                await client.send_message(message.chat.id, "🛑 Process was cancelled by Admin.")
-                break
-                
             line = lines[i]
             
             # Extract URL using Regex
@@ -156,12 +153,29 @@ async def process_document(client: Client, message: Message):
                 # Strip trailing colons, spaces, and pipes
                 title = re.sub(r'[\s:\|]+$', '', title).strip()
                 
-                if title:
-                    await process_link(client, title, url, status_msg)
-                else:
-                    await client.send_message(message.chat.id, f"⚠️ Could not find a valid title for URL:\n`{url}`")
-            
+                # Check for multi-line URL continuations
+                j = i + 1
+                while j < len(lines):
+                    next_line = lines[j].strip()
+                    if not re.search(r'https?://', next_line) and (next_line.startswith('URLPrefix') or next_line.startswith('&') or next_line.startswith('?')):
+                        url += next_line
+                        j += 1
+                    else:
+                        break
+                        
+                parsed_items.append((title, url))
+                i = j - 1
             i += 1
+
+        for title, url in parsed_items:
+            if cancel_process:
+                await client.send_message(message.chat.id, "🛑 Process was cancelled by Admin.")
+                break
+                
+            if title:
+                await process_link(client, title, url, status_msg)
+            else:
+                await client.send_message(message.chat.id, f"⚠️ Could not find a valid title for URL:\n`{url}`")
                 
         await update_status(status_msg, "✅ All valid links have been downloaded and uploaded successfully!")
     except Exception as e:
@@ -199,6 +213,12 @@ def download_video(url: str, title: str, status_msg: Message, client: Client) ->
         'quiet': True,
         'no_warnings': True,
         'progress_hooks': [lambda d: yt_progress_hook(d, status_msg, client, last_edit_time, title)],
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Referer': 'https://pw.live/'
+        },
+        'sleep_requests': 1
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
