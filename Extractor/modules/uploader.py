@@ -62,9 +62,20 @@ async def upload_cmd(client: Client, message: Message):
     cancel_process = False
     if not hasattr(client, 'awaiting_upload'):
         client.awaiting_upload = {}
+    if not hasattr(client, 'upload_tokens'):
+        client.upload_tokens = {}
+        
+    token = None
+    if len(message.command) > 1:
+        token = message.command[1]
+        
     client.awaiting_upload[message.from_user.id] = True
+    client.upload_tokens[message.from_user.id] = token
     
-    await message.reply_text("📂 Please send me the `.txt` file containing the titles and URLs.")
+    msg = "📂 Please send me the `.txt` file containing the titles and URLs."
+    if token:
+        msg += "\n🔑 **Token Received!** It will be used for authenticated downloads."
+    await message.reply_text(msg)
 
 # ==========================================
 # Progress Bars and Hooks
@@ -165,10 +176,13 @@ async def process_document(client: Client, message: Message):
                         
                 # Aggressive cleanup to prevent malformed requests and 404s
                 url = url.replace('\n', '').replace('\r', '').replace(' ', '')
+                url = url.replace('%0A', '').replace('%0D', '')
                 
                 parsed_items.append((title, url))
                 i = j - 1
             i += 1
+
+        token = getattr(client, 'upload_tokens', {}).get(message.from_user.id)
 
         for title, url in parsed_items:
             if cancel_process:
@@ -176,7 +190,7 @@ async def process_document(client: Client, message: Message):
                 break
                 
             if title:
-                await process_link(client, title, url, status_msg)
+                await process_link(client, title, url, status_msg, token)
             else:
                 await client.send_message(message.chat.id, f"⚠️ Could not find a valid title for URL:\n`{url}`")
                 
@@ -204,11 +218,25 @@ async def download_pdf(url: str, title: str) -> str:
                 return file_name
     return None
 
-def download_video(url: str, title: str, status_msg: Message, client: Client) -> str:
+def download_video(url: str, title: str, status_msg: Message, client: Client, token: str = None) -> str:
     """Downloads a video (including .mpd) using yt-dlp and ffmpeg."""
     safe_title = "".join(x for x in title if x.isalnum() or x in "._- ")
     last_edit_time = [0.0]
     
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': 'https://pw.live',
+        'Referer': 'https://pw.live/',
+        'Accept': '*/*',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site'
+    }
+    
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+        headers['Cookie'] = f'token={token}'
+        
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
@@ -216,15 +244,7 @@ def download_video(url: str, title: str, status_msg: Message, client: Client) ->
         'quiet': True,
         'no_warnings': True,
         'progress_hooks': [lambda d: yt_progress_hook(d, status_msg, client, last_edit_time, title)],
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Origin': 'https://pw.live',
-            'Referer': 'https://pw.live/',
-            'Accept': '*/*',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'cross-site'
-        },
+        'http_headers': headers,
         'sleep_requests': 1
     }
     
@@ -240,7 +260,7 @@ def download_video(url: str, title: str, status_msg: Message, client: Client) ->
                     return base + ext
         return filename
 
-async def process_link(client: Client, title: str, url: str, status_msg: Message):
+async def process_link(client: Client, title: str, url: str, status_msg: Message, token: str = None):
     """Orchestrates downloading and uploading for a single line."""
     await update_status(status_msg, f"🔄 **Processing:** `{title}`\n📥 **Status:** Downloading...")
     
@@ -254,7 +274,7 @@ async def process_link(client: Client, title: str, url: str, status_msg: Message
             is_video = True
             loop = asyncio.get_event_loop()
             try:
-                downloaded_file = await loop.run_in_executor(None, download_video, url, title, status_msg, client)
+                downloaded_file = await loop.run_in_executor(None, download_video, url, title, status_msg, client, token)
             except Exception as e:
                 await client.send_message(status_msg.chat.id, f"❌ Failed to download video.\nError: {str(e)}\nURL: {url}")
                 return
