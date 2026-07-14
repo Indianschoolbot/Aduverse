@@ -5,6 +5,7 @@ import aiohttp
 import yt_dlp
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.errors import MessageNotModified
 
 # ==========================================
 # Configuration (Replace with actual values)
@@ -20,6 +21,12 @@ app = Client("uploader_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOK
 # Global variables to store state
 TARGET_CHANNEL_ID = None
 WAITING_FOR_FILE = False
+
+async def update_status(status_msg: Message, text: str):
+    try:
+        await status_msg.edit_text(text)
+    except MessageNotModified:
+        pass
 
 # ==========================================
 # Filters and Commands
@@ -81,35 +88,37 @@ async def handle_document(client: Client, message: Message):
     status_msg = await message.reply_text("⏳ Downloading the .txt file...")
     
     file_path = await message.download()
-    await status_msg.edit_text("🔍 Parsing the file and starting the sequential download/upload process...")
+    await update_status(status_msg, "🔍 Parsing the file and starting the sequential download/upload process...")
     
     try:
         with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+            lines = [line.strip() for line in f.readlines() if line.strip()]
             
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            
+            # Extract URL using Regex
+            url_match = re.search(r'(https?://[^\s)\]]+)', line)
+            if url_match:
+                url = url_match.group(1)
+                title = line[:url_match.start()].strip()
                 
-            # Expected format: Title || Information: [https://link.com/file.mpd](https://link.com/file.mpd)
-            # Or similar, separated by "||"
-            parts = line.split("||", 1)
-            if len(parts) == 2:
-                title = parts[0].strip()
-                url_part = parts[1].strip()
+                # If title is empty on this line, check the previous line
+                if not title and i > 0:
+                    title = lines[i-1]
                 
-                # Extract URL using Regex
-                url_match = re.search(r'(https?://[^\s)\]]+)', url_part)
-                if url_match:
-                    url = url_match.group(1)
+                # Strip trailing colons, spaces, and pipes
+                title = re.sub(r'[\s:\|]+$', '', title).strip()
+                
+                if title:
                     await process_link(client, title, url, status_msg)
                 else:
-                    await client.send_message(message.chat.id, f"⚠️ Could not find a valid URL in line:\n`{line}`")
-            else:
-                await client.send_message(message.chat.id, f"⚠️ Invalid line format (missing '||'):\n`{line}`")
+                    await client.send_message(message.chat.id, f"⚠️ Could not find a valid title for URL:\n`{url}`")
+            
+            i += 1
                 
-        await status_msg.edit_text("✅ All valid links have been downloaded and uploaded successfully!")
+        await update_status(status_msg, "✅ All valid links have been downloaded and uploaded successfully!")
     except Exception as e:
         await message.reply_text(f"❌ An error occurred while parsing the file: {e}")
     finally:
@@ -164,7 +173,7 @@ def download_video(url: str, title: str) -> str:
 
 async def process_link(client: Client, title: str, url: str, status_msg: Message):
     """Orchestrates downloading and uploading for a single line."""
-    await status_msg.edit_text(f"🔄 **Processing:** `{title}`\n📥 **Status:** Downloading...")
+    await update_status(status_msg, f"🔄 **Processing:** `{title}`\n📥 **Status:** Downloading...")
     
     downloaded_file = None
     is_video = False
@@ -183,19 +192,19 @@ async def process_link(client: Client, title: str, url: str, status_msg: Message
             await client.send_message(status_msg.chat.id, f"❌ Failed to download:\n`{title}`\nURL: {url}")
             return
             
-        await status_msg.edit_text(f"🔄 **Processing:** `{title}`\n📤 **Status:** Uploading to channel...")
+        await update_status(status_msg, f"🔄 **Processing:** `{title}`\n📤 **Status:** Uploading to channel...")
         
         # Uploading to target channel
         if is_video:
             await client.send_video(
-                chat_id=TARGET_CHANNEL_ID,
+                chat_id=int(TARGET_CHANNEL_ID),
                 video=downloaded_file,
                 caption=f"**{title}**",
                 supports_streaming=True
             )
         else:
             await client.send_document(
-                chat_id=TARGET_CHANNEL_ID,
+                chat_id=int(TARGET_CHANNEL_ID),
                 document=downloaded_file,
                 caption=f"**{title}**"
             )
