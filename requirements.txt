@@ -21,3 +21,4 @@ dotenv
 flask
 pyrogram
 yt-dlp
+tgcrypto

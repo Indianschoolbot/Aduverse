@@ -3,20 +3,14 @@ import re
 import asyncio
 import aiohttp
 import yt_dlp
+import time
 from pyrogram import Client, filters
 from pyrogram.types import Message
 from pyrogram.errors import MessageNotModified
+from Extractor import app
+from config import OWNER_ID
 
-# ==========================================
-# Configuration (Replace with actual values)
-# ==========================================
-API_ID = 20834239  # Replace with your API_ID (integer)
-API_HASH = "df0f365b94727a26c1b8bcddb3d7b181"  # Replace with your API_HASH (string)
-BOT_TOKEN = "8871109208:AAFtOCsd4Mbu4macLkD5niFUcEuEDwlVc7w"  # Replace with your BOT_TOKEN (string)
-ADMIN_ID = 1450246428  # Replace with your Telegram User ID (integer)
-
-# Initialize Pyrogram Client
-app = Client(":memory:", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+ADMIN_ID = OWNER_ID
 
 # Global variables to store state
 TARGET_CHANNEL_ID = None
@@ -33,19 +27,10 @@ async def update_status(status_msg: Message, text: str):
 # Filters and Commands
 # ==========================================
 
-# Custom filter to restrict bot to Admin only
 def admin_filter(_, __, message: Message):
     return bool(message.from_user and message.from_user.id == ADMIN_ID)
 
 is_admin = filters.create(admin_filter)
-
-@app.on_message(filters.command("start") & is_admin)
-async def start_cmd(client: Client, message: Message):
-    await message.reply_text(
-        "👋 Hello Admin! I am your Uploader Bot.\n\n"
-        "1. First, use `/id <channel_id>` to set the target channel.\n"
-        "2. Then, use `/upload` to send me the .txt file."
-    )
 
 @app.on_message(filters.command("id") & is_admin)
 async def set_channel_id(client: Client, message: Message):
@@ -78,12 +63,48 @@ async def upload_cmd(client: Client, message: Message):
     await message.reply_text("📂 Please send me the `.txt` file containing the titles and URLs.")
 
 # ==========================================
+# Progress Bars and Hooks
+# ==========================================
+
+async def progress_for_pyrogram(current, total, status_msg, start_time, last_edit_time, title, action="Uploading"):
+    current_time = time.time()
+    if current_time - last_edit_time[0] > 5 or current == total:
+        percent = round((current / total) * 100, 2)
+        try:
+            speed = current / (current_time - start_time)
+        except ZeroDivisionError:
+            speed = 0
+            
+        # Format speed
+        speed_str = f"{speed / 1024 / 1024:.2f} MB/s" if speed > 1024 * 1024 else f"{speed / 1024:.2f} KB/s"
+        
+        text = f"🔄 **Processing:** `{title}`\n📤 **Status:** {action} to channel...\n📊 **Progress:** {percent}%\n🚀 **Speed:** {speed_str}"
+        await update_status(status_msg, text)
+        last_edit_time[0] = current_time
+
+def yt_progress_hook(d, status_msg, client, last_edit_time, title):
+    if d['status'] == 'downloading':
+        current_time = time.time()
+        if current_time - last_edit_time[0] > 5:
+            percent = d.get('_percent_str', 'N/A')
+            speed = d.get('_speed_str', 'N/A')
+            eta = d.get('_eta_str', 'N/A')
+            text = f"🔄 **Processing:** `{title}`\n📥 **Status:** Downloading...\n📊 **Progress:** {percent}\n🚀 **Speed:** {speed}\n⏳ **ETA:** {eta}"
+            
+            # Send to asyncio loop
+            asyncio.run_coroutine_threadsafe(
+                update_status(status_msg, text), 
+                client.loop
+            )
+            last_edit_time[0] = current_time
+
+# ==========================================
 # File Processing & Downloading Engines
 # ==========================================
 
 @app.on_message(filters.document & is_admin)
 async def handle_document(client: Client, message: Message):
-    global WAITING_FOR_FILE
+    global WAITING_FOR_FILE, cancel_process
     
     if not WAITING_FOR_FILE:
         return
@@ -104,7 +125,6 @@ async def handle_document(client: Client, message: Message):
             
         i = 0
         while i < len(lines):
-            global cancel_process
             if cancel_process:
                 await client.send_message(message.chat.id, "🛑 Process was cancelled by Admin.")
                 break
@@ -155,17 +175,18 @@ async def download_pdf(url: str, title: str) -> str:
                 return file_name
     return None
 
-def download_video(url: str, title: str) -> str:
+def download_video(url: str, title: str, status_msg: Message, client: Client) -> str:
     """Downloads a video (including .mpd) using yt-dlp and ffmpeg."""
     safe_title = "".join(x for x in title if x.isalnum() or x in "._- ")
+    last_edit_time = [0.0]
     
-    # yt-dlp configuration for downloading and merging to mp4
     ydl_opts = {
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'outtmpl': f'{safe_title}.%(ext)s',
         'quiet': True,
         'no_warnings': True,
+        'progress_hooks': [lambda d: yt_progress_hook(d, status_msg, client, last_edit_time, title)],
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -191,12 +212,10 @@ async def process_link(client: Client, title: str, url: str, status_msg: Message
         if url.lower().endswith(".pdf"):
             downloaded_file = await download_pdf(url, title)
         else:
-            # Assume it's a video stream/link (.mpd, .mp4, m3u8, etc.)
             is_video = True
-            # yt-dlp is synchronous, so we run it in an executor to avoid blocking the bot
             loop = asyncio.get_event_loop()
             try:
-                downloaded_file = await loop.run_in_executor(None, download_video, url, title)
+                downloaded_file = await loop.run_in_executor(None, download_video, url, title, status_msg, client)
             except Exception as e:
                 await client.send_message(status_msg.chat.id, f"❌ Failed to download video.\nError: {str(e)}\nURL: {url}")
                 return
@@ -208,18 +227,25 @@ async def process_link(client: Client, title: str, url: str, status_msg: Message
         await update_status(status_msg, f"🔄 **Processing:** `{title}`\n📤 **Status:** Uploading to channel...")
         
         # Uploading to target channel
+        start_time = time.time()
+        last_edit_time = [0.0]
+        
         if is_video:
             await client.send_video(
                 chat_id=int(TARGET_CHANNEL_ID),
                 video=downloaded_file,
                 caption=f"**{title}**",
-                supports_streaming=True
+                supports_streaming=True,
+                progress=progress_for_pyrogram,
+                progress_args=(status_msg, start_time, last_edit_time, title, "Uploading video")
             )
         else:
             await client.send_document(
                 chat_id=int(TARGET_CHANNEL_ID),
                 document=downloaded_file,
-                caption=f"**{title}**"
+                caption=f"**{title}**",
+                progress=progress_for_pyrogram,
+                progress_args=(status_msg, start_time, last_edit_time, title, "Uploading document")
             )
             
     except Exception as e:
@@ -232,10 +258,3 @@ async def process_link(client: Client, title: str, url: str, status_msg: Message
                 print(f"Deleted local file: {downloaded_file}")
             except OSError as e:
                 print(f"Error removing file {downloaded_file}: {e}")
-
-# ==========================================
-# Run the Bot
-# ==========================================
-if __name__ == "__main__":
-    print("Bot is starting... Ensure API_ID, API_HASH, BOT_TOKEN, and ADMIN_ID are correctly set.")
-    app.run()
