@@ -163,6 +163,9 @@ async def process_document(client: Client, message: Message):
                     else:
                         break
                         
+                # Aggressive cleanup to prevent malformed requests and 404s
+                url = url.replace('\n', '').replace('\r', '').replace(' ', '')
+                
                 parsed_items.append((title, url))
                 i = j - 1
             i += 1
@@ -214,9 +217,13 @@ def download_video(url: str, title: str, status_msg: Message, client: Client) ->
         'no_warnings': True,
         'progress_hooks': [lambda d: yt_progress_hook(d, status_msg, client, last_edit_time, title)],
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Origin': 'https://pw.live',
+            'Referer': 'https://pw.live/',
             'Accept': '*/*',
-            'Referer': 'https://pw.live/'
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'cross-site'
         },
         'sleep_requests': 1
     }
